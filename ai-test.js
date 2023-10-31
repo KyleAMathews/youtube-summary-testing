@@ -13,7 +13,7 @@ async function summarizeChunk(chunk, i, responseMap, progressAmount) {
   let response
   try {
     response = await sdk.post_chat_completions({
-      model: `mistral-7b-instruct`,
+      model: `openhermes-2-mistral-7b`,
       messages: [
         {
           role: `system`,
@@ -39,7 +39,7 @@ async function reduceChunks(chunks) {
   let response
   try {
     response = await sdk.post_chat_completions({
-      model: `mistral-7b-instruct`,
+      model: `openhermes-2-mistral-7b`,
       messages: [
         {
           role: `system`,
@@ -64,54 +64,95 @@ const splitter = new RecursiveCharacterTextSplitter({
   chunkSize: 4000,
   chunkOverlap: 200,
 })
-export async function summarizeChunks(chunks, video, responseMap) {
+function chunkArray(array, size) {
+  const chunked = []
+  for (let i = 0; i < array.length; i += size) {
+    chunked.push(array.slice(i, i + size))
+  }
+  return chunked
+}
+
+export async function summarizeChunks(allChunks, video, responseMap) {
   // Setup data structure on video.
   if (!video.summaries) {
     video.summaries = []
   }
-  const summary = {}
-  const numAPICalls = chunks.length + 1
-  let summaries
-  try {
-    summaries = await Promise.all(
-      chunks.map((chunk, i) =>
-        summarizeChunk(chunk, i, responseMap, 1 / numAPICalls)
-      )
-    )
-  } catch (e) {
-    console.log(e)
-  }
-  summary.chunkSummaries = summaries
+  const summary = { chunkSummaries: [], summary: null, moreSummaries: [] }
 
-  const numTokens = summaries.join(` `).length / 1 / Math.E
-  console.log(
-    `chunk summaries done, starting final summary of ~${numTokens} tokens`
+  const size = 60 / 5
+  // Split into 1 hour segments.
+  const chunkedArray = chunkArray(allChunks, size)
+
+  const numAPICalls =
+    chunkedArray.reduce((acc, chunks) => (acc += chunks.length), 0) +
+    chunkedArray.length
+
+  console.log(`chunkedArray`, chunkedArray.length)
+
+  await Promise.all(
+    chunkedArray.map(async (chunks, i) => {
+      console.log(`chunk summary`, i)
+      let summaries
+      try {
+        summaries = await Promise.all(
+          chunks.map((chunk, i) =>
+            summarizeChunk(chunk, i, responseMap, 1 / numAPICalls)
+          )
+        )
+      } catch (e) {
+        console.log(e)
+      }
+      // backwards compatability.
+      if (i == 0) {
+        summary.chunkSummaries = summaries
+      } else {
+        summary.moreSummaries[i - 1] = {
+          chunkSummaries: summaries,
+        }
+      }
+
+      const numTokens = summaries.join(` `).length / 1 / Math.E
+      console.log(
+        `chunk summaries done, starting final summary of ~${numTokens} tokens`
+      )
+
+      let response
+      if (numTokens < 4000) {
+        response = await reduceChunks(summaries)
+      } else {
+        // chunk again to get smaller summary.
+        const output = (
+          await splitter.createDocuments([summaries.join(`\n\n`)])
+        ).map((p) => p.pageContent)
+        console.log(
+          `too many chunks, further reducing ${output.length} new chunks`
+        )
+        try {
+          summaries = await Promise.all(
+            output.map((chunk, i) =>
+              summarizeChunk(chunk, i, responseMap, 1 / numAPICalls)
+            )
+          )
+        } catch (e) {
+          console.log(e)
+        }
+        const numTokens = summaries.join(` `).length / 1 / Math.E
+        console.log(
+          `2nd chunk summaries done, starting final summary of ~${numTokens} tokens`
+        )
+        response = await reduceChunks(summaries)
+      }
+
+      // backwards compatability.
+      if (i == 0) {
+        summary.summary = response.data.choices[0].message.content
+      } else {
+        summary.moreSummaries[i - 1].summary =
+          response.data.choices[0].message.content
+      }
+    })
   )
 
-  let response
-  if (numTokens < 4000) {
-    response = await reduceChunks(summaries)
-  } else {
-    // chunk again to get smaller summary.
-    const output = (
-      await splitter.createDocuments([summaries.join(`\n\n`)])
-    ).map((p) => p.pageContent)
-    console.log(`too many chunks, further reducing ${output.length} new chunks`)
-    try {
-      summaries = await Promise.all(
-        output.map((chunk, i) => summarizeChunk(chunk, i))
-      )
-    } catch (e) {
-      console.log(e)
-    }
-    const numTokens = summaries.join(` `).length / 1 / Math.E
-    console.log(
-      `2nd chunk summaries done, starting final summary of ~${numTokens} tokens`
-    )
-    response = await reduceChunks(summaries)
-  }
-
-  summary.summary = response.data.choices[0].message.content
   console.log(`summary is done`)
   video.summaries.push(summary)
   return video
